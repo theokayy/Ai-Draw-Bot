@@ -16,27 +16,42 @@ HEADERS = {
 }
 
 # League Weightings (API-Football League IDs)
-# Serie A (135), Ligue 1 (61), Arg Primera (128), USL (253), NPFL (284)
 HIGH_DRAW_LEAGUES = {135: 0.04, 61: 0.04, 128: 0.05, 253: 0.03, 284: 0.06}
-# Bundesliga (78), Eredivisie (88)
 LOW_DRAW_LEAGUES = {78: -0.04, 88: -0.05}
 
-def get_todays_odds():
-    """Fetch today's matches and their pre-match odds in one call to save API limits."""
+def get_daily_data():
+    """Fetches fixtures (for names) and odds, then matches them together."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    endpoint = f"{BASE_URL}/odds?date={today}&bookmaker=1" # Bookmaker 1 is typically 10bet/Bet365
-    response = requests.get(endpoint, headers=HEADERS)
-    if response.status_code != 200:
-        return []
     
-    data = response.json().get('response', [])
-    return data
+    # STEP 1: Get the Fixtures Dictionary (To get the real team names)
+    fixtures_endpoint = f"{BASE_URL}/fixtures?date={today}"
+    fixtures_response = requests.get(fixtures_endpoint, headers=HEADERS)
+    
+    match_dictionary = {}
+    if fixtures_response.status_code == 200:
+        fixtures_data = fixtures_response.json().get('response', [])
+        for f in fixtures_data:
+            fixture_id = f['fixture']['id']
+            match_dictionary[fixture_id] = {
+                "home": f['teams']['home']['name'],
+                "away": f['teams']['away']['name'],
+                "league": f['league']['name']
+            }
 
-def calculate_probabilities(match_data):
+    # STEP 2: Get the Odds
+    odds_endpoint = f"{BASE_URL}/odds?date={today}&bookmaker=1"
+    odds_response = requests.get(odds_endpoint, headers=HEADERS)
+    odds_data = []
+    if odds_response.status_code == 200:
+        odds_data = odds_response.json().get('response', [])
+        
+    return odds_data, match_dictionary
+
+def calculate_probabilities(match_data, match_dictionary):
     """Calculates AI Probability, Market Probability, and Value Edge."""
     try:
         fixture = match_data['fixture']
-        league = match_data['league']
+        fixture_id = fixture['id']
         bookmakers = match_data['bookmakers']
         
         if not bookmakers:
@@ -53,7 +68,7 @@ def calculate_probabilities(match_data):
         draw_odds = float(next(v['odd'] for v in match_winner_bet['values'] if v['value'] == 'Draw'))
         away_odds = float(next(v['odd'] for v in match_winner_bet['values'] if v['value'] == 'Away'))
 
-        # Extract Under 2.5 Goals Odds (Id 5) for Goal Expectancy Logic
+        # Extract Under 2.5 Goals Odds (Id 5)
         ou_bet = next((b for b in bets if b['id'] == 5), None)
         under_2_5_odds = 2.0 # Default baseline
         if ou_bet:
@@ -65,16 +80,17 @@ def calculate_probabilities(match_data):
         # 1. Market Probability
         market_prob = 1 / draw_odds
 
+        # Look up the real names from our dictionary
+        real_names = match_dictionary.get(fixture_id, {"home": f"Team {fixture_id}", "away": "Away", "league": "Unknown"})
+
         # 2. AI Probability Calculation
-        # Base probability derived from global average
         base_prob = 0.28 
         
-        # League Tendency
-        league_id = league['id']
+        # We need the league ID for our weightings. Sometimes it's in the odds data, sometimes not.
+        league_id = match_data.get('league', {}).get('id', 0)
         league_weight = HIGH_DRAW_LEAGUES.get(league_id, 0.0) + LOW_DRAW_LEAGUES.get(league_id, 0.0)
         
-        # Team Balance Estimation (Elo-style heuristic)
-        # Closer odds between Home and Away = tighter match = higher draw probability
+        # Team Balance Estimation
         odds_diff = abs(home_odds - away_odds)
         balance_weight = 0.0
         if odds_diff < 0.5:
@@ -82,8 +98,7 @@ def calculate_probabilities(match_data):
         elif odds_diff > 2.0:
             balance_weight = -0.05
             
-        # Goal Expectancy Logic (Low scoring games draw more often)
-        # If Under 2.5 odds are low (e.g., < 1.70), market expects few goals
+        # Goal Expectancy Logic
         goal_expectancy_weight = 0.0
         if under_2_5_odds < 1.60:
             goal_expectancy_weight = 0.05
@@ -92,22 +107,20 @@ def calculate_probabilities(match_data):
 
         # Final AI Probability
         ai_prob = base_prob + league_weight + balance_weight + goal_expectancy_weight
-        
-        # Cap probabilities between 0 and 1
         ai_prob = max(0.01, min(0.99, ai_prob))
 
         # 3. Value Edge
         value_edge = ai_prob - market_prob
 
         return {
-            "home": match_data['fixture']['teams']['home']['name'] if 'teams' in match_data['fixture'] else "Home", # API odds endpoint structure adjustment
-            "away": match_data['fixture']['teams']['away']['name'] if 'teams' in match_data['fixture'] else "Away",
-            "league": league['name'],
+            "home": real_names['home'],
+            "away": real_names['away'],
+            "league": real_names['league'],
             "draw_odds": draw_odds,
             "ai_prob": ai_prob,
             "market_prob": market_prob,
             "value_edge": value_edge,
-            "fixture_id": fixture['id']
+            "fixture_id": fixture_id
         }
     except Exception as e:
         return None
@@ -117,39 +130,21 @@ async def send_telegram_message(formatted_text):
     await bot.send_message(chat_id=CHAT_ID, text=formatted_text, parse_mode='HTML')
 
 def run_system():
-    odds_data = get_todays_odds()
+    odds_data, match_dictionary = get_daily_data()
     
     value_draws = []
     good_value = []
     avoid = []
     
-    # We will fetch team names by matching fixture IDs since the /odds endpoint 
-    # sometimes omits team names depending on the API subscription tier.
-    # For a production system with API-Sports, we fetch /fixtures first, but 
-    # to maintain high efficiency, we extract names assuming standard payload.
-    
     for match in odds_data:
-        # Hack to get names from odds endpoint if teams object is missing
-        try:
-             home_team = match['fixture']['match'].split(' - ')[0] if 'match' in match['fixture'] else f"Team {match['fixture']['id']}"
-             away_team = match['fixture']['match'].split(' - ')[1] if 'match' in match['fixture'] else ""
-        except:
-             home_team, away_team = "Home", "Away"
-
-        analysis = calculate_probabilities(match)
+        analysis = calculate_probabilities(match, match_dictionary)
         
         if analysis:
-            # Overwrite with better names if available
-            if 'home' in analysis and analysis['home'] != "Home":
-                pass # Used the one from calculate_probabilities
-            else:
-                analysis['home'] = home_team
-                analysis['away'] = away_team
-
             edge = analysis['value_edge']
-            if edge >= 0.10:
+            # NOTE: Threshold set to 0.05 so you get more matches on your daily slip!
+            if edge >= 0.05:
                 value_draws.append(analysis)
-            elif 0.05 <= edge < 0.10:
+            elif 0.02 <= edge < 0.05:
                 good_value.append(analysis)
             else:
                 avoid.append(analysis)
@@ -165,7 +160,7 @@ def run_system():
     slip_teams = []
     if not value_draws:
         msg += "No strong value draws today.\n"
-    for m in value_draws[:5]: # Limit to top 5 to avoid message length limits
+    for m in value_draws[:5]:
         msg += f"{m['home']} vs {m['away']} | {m['league']}\n"
         msg += f"AI: {m['ai_prob']*100:.1f}% vs Market: {m['market_prob']*100:.1f}%\n"
         msg += f"EDGE: +{m['value_edge']:.2f} | Odds: {m['draw_odds']}\n\n"
